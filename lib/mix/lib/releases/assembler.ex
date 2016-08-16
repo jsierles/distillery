@@ -61,7 +61,7 @@ defmodule Mix.Releases.Assembler do
     env_profile = Map.from_struct(env_profile)
     profile = Enum.reduce(env_profile, rel_profile, fn {k, v}, acc ->
       case v do
-        nil -> acc
+        ignore when ignore in [nil, []] -> acc
         _   -> Map.put(acc, k, v)
       end
     end)
@@ -155,6 +155,15 @@ defmodule Mix.Releases.Assembler do
     case include_erts? do
       true ->
         copy_app(app_dir, target_dir, dev_mode?, include_src?)
+      p when is_binary(p) ->
+        case is_erts_lib?(app_dir) do
+          true ->
+            erts_lib_path = Path.expand(Path.join(p, "lib"))
+            proper_app_dir = Path.join(erts_lib_path, "#{app_name}-#{app_version}")
+            copy_app(proper_app_dir, target_dir, dev_mode?, include_src?)
+          false ->
+            copy_app(app_dir, target_dir, dev_mode?, include_src?)
+        end
       _ ->
         case is_erts_lib?(app_dir) do
           true ->
@@ -192,7 +201,7 @@ defmodule Mix.Releases.Assembler do
               "Reason: #{reason}"
           :ok ->
             Path.wildcard(Path.join(app_dir, "*"))
-            |> Enum.filter(fn p -> Path.basename(p) in ["ebin", "include", "priv", "lib"] end)
+            |> Enum.filter(fn p -> Path.basename(p) in ["ebin", "include", "priv", "lib", "src"] end)
             |> Enum.each(fn p ->
               t = Path.join(target_dir, Path.basename(p))
               case File.cp_r(p, t) do
@@ -209,9 +218,8 @@ defmodule Mix.Releases.Assembler do
   end
 
   # Determines if the given application directory is part of the Erlang installation
-  defp is_erts_lib?(app_dir) do
-    String.starts_with?(app_dir, "#{:code.lib_dir()}")
-  end
+  defp is_erts_lib?(app_dir), do: is_erts_lib?(app_dir, "#{:code.lib_dir()}")
+  defp is_erts_lib?(app_dir, lib_dir), do: String.starts_with?(app_dir, lib_dir)
 
   defp remove_symlink_or_dir!(path) do
     case File.exists?(path) do
@@ -240,7 +248,9 @@ defmodule Mix.Releases.Assembler do
         release_file     = Path.join(rel_dir, "#{relname}.rel")
         start_clean_file = Path.join(rel_dir, "start_clean.rel")
         start_clean_rel  = %{release |
-           :applications => Enum.filter(release.applications, fn %App{name: n} -> n in [:kernel, :stdlib] end)}
+                             :applications => Enum.filter(release.applications, fn %App{name: n} ->
+                               n in [:kernel, :stdlib, :compiler, :elixir, :iex]
+                             end)}
         with :ok <- write_relfile(release_file, release),
              :ok <- write_relfile(start_clean_file, start_clean_rel),
              :ok <- write_binfile(release, rel_dir),
@@ -363,7 +373,8 @@ defmodule Mix.Releases.Assembler do
   defp extract_relfile_apps(path) do
     case Utils.read_terms(path) do
       {:error, err} -> raise err
-      {:ok, [{:release, _rel, _erts, apps}]} -> apps
+      {:ok, [{:release, _rel, _erts, apps}]} ->
+        Enum.map(apps, fn {a, v} -> {a, v}; {a, v, _start_type} -> {a, v} end)
       {:ok, other} -> raise "malformed relfile (#{path}): #{inspect other}"
     end
   end
@@ -454,6 +465,21 @@ defmodule Mix.Releases.Assembler do
   end
 
   # Generates start_erl.data
+  defp generate_start_erl_data(%Release{version: version, profile: %Profile{include_erts: false}}, rel_dir) do
+    Logger.debug "Generating start_erl.data"
+    contents = "ERTS_VSN #{version}"
+    File.write(Path.join([rel_dir, "..", "start_erl.data"]), contents)
+  end
+  defp generate_start_erl_data(%Release{profile: %Profile{include_erts: path}} = release, rel_dir)
+    when is_binary(path) do
+    Logger.debug "Generating start_erl.data"
+    case Utils.detect_erts_version(path) do
+      {:error, _} = err -> err
+      {:ok, vsn} ->
+        contents = "#{vsn} #{release.version}"
+        File.write(Path.join([rel_dir, "..", "start_erl.data"]), contents)
+    end
+  end
   defp generate_start_erl_data(release, rel_dir) do
     Logger.debug "Generating start_erl.data"
     contents = "#{Utils.erts_version} #{release.version}"
@@ -506,36 +532,57 @@ defmodule Mix.Releases.Assembler do
   defp include_erts(%Release{profile: %Profile{include_erts: include_erts}, output_dir: output_dir} = release) do
     prefix = case include_erts do
                true -> "#{:code.root_dir}"
-               p when is_binary(p) -> Path.absname(p)
+               p when is_binary(p) ->
+                 Path.expand(p)
              end
-    erts_vsn = Utils.erts_version()
-    erts_dir = Path.join(prefix, "erts-#{erts_vsn}")
+    erts_vsn = case include_erts do
+                 true -> Utils.erts_version()
+                 p when is_binary(p) ->
+                   case Utils.detect_erts_version(prefix) do
+                     {:ok, vsn} ->
+                       # verify that the path given was actually the right one
+                       case File.exists?(Path.join(prefix, "bin")) do
+                         true -> vsn
+                         false ->
+                           pfx = Path.relative_to_cwd(prefix)
+                           maybe_path = Path.relative_to_cwd(Path.expand(Path.join(prefix, "..")))
+                           {:error, "invalid ERTS path, did you mean #{maybe_path} instead of #{pfx}?"}
+                       end
+                     {:error, _} = err -> err
+                   end
+               end
+    case erts_vsn do
+      {:error, _} = err ->
+        err
+      _ ->
+        erts_dir = Path.join([prefix, "erts-#{erts_vsn}"])
 
-    Logger.info "Including ERTS #{erts_vsn} from #{Path.relative_to_cwd(erts_dir)}"
+        Logger.info "Including ERTS #{erts_vsn} from #{Path.relative_to_cwd(erts_dir)}"
 
-    erts_output_dir      = Path.join(output_dir, "erts-#{erts_vsn}")
-    erl_path             = Path.join([erts_output_dir, "bin", "erl"])
-    nodetool_path        = Path.join([output_dir, "bin", "nodetool"])
-    nodetool_dest        = Path.join([erts_output_dir, "bin", "nodetool"])
-    install_upgrade_path = Path.join([output_dir, "bin", "install_upgrade.escript"])
-    install_upgrade_dest = Path.join([erts_output_dir, "bin", "install_upgrade.escript"])
-    with :ok      <- remove_if_exists(erts_output_dir),
-         :ok      <- File.mkdir_p(erts_output_dir),
-         {:ok, _} <- File.cp_r(erts_dir, erts_output_dir),
-         {:ok, _} <- File.rm_rf(erl_path),
-         {:ok, erl_script} <- Utils.template(:erl_script, release.profile.overlay_vars),
-         :ok      <- File.write(erl_path, erl_script),
-         :ok      <- File.chmod(erl_path, 0o755),
-         :ok      <- File.cp(nodetool_path, nodetool_dest),
-         :ok      <- File.cp(install_upgrade_path, install_upgrade_dest),
-         :ok      <- File.chmod(nodetool_dest, 0o755),
-         :ok      <- File.chmod(install_upgrade_dest, 0o755) do
-      :ok
-    else
-      {:error, reason} ->
-        {:error, "Failed during include_erts: #{inspect reason}"}
-      {:error, reason, file} ->
-        {:error, "Failed to remove file during include_erts: #{inspect reason} #{file}"}
+        erts_output_dir      = Path.join(output_dir, "erts-#{erts_vsn}")
+        erl_path             = Path.join([erts_output_dir, "bin", "erl"])
+        nodetool_path        = Path.join([output_dir, "bin", "nodetool"])
+        nodetool_dest        = Path.join([erts_output_dir, "bin", "nodetool"])
+        install_upgrade_path = Path.join([output_dir, "bin", "install_upgrade.escript"])
+        install_upgrade_dest = Path.join([erts_output_dir, "bin", "install_upgrade.escript"])
+        with :ok     <- remove_if_exists(erts_output_dir),
+            :ok      <- File.mkdir_p(erts_output_dir),
+            {:ok, _} <- File.cp_r(erts_dir, erts_output_dir),
+            {:ok, _} <- File.rm_rf(erl_path),
+            {:ok, erl_script} <- Utils.template(:erl_script, release.profile.overlay_vars),
+            :ok      <- File.write(erl_path, erl_script),
+            :ok      <- File.chmod(erl_path, 0o755),
+            :ok      <- File.cp(nodetool_path, nodetool_dest),
+            :ok      <- File.cp(install_upgrade_path, install_upgrade_dest),
+            :ok      <- File.chmod(nodetool_dest, 0o755),
+            :ok      <- File.chmod(install_upgrade_dest, 0o755) do
+          :ok
+        else
+          {:error, reason} ->
+            {:error, "Failed during include_erts: #{inspect reason}"}
+          {:error, reason, file} ->
+            {:error, "Failed to remove file during include_erts: #{inspect reason} #{file}"}
+        end
     end
   end
 
@@ -553,9 +600,14 @@ defmodule Mix.Releases.Assembler do
   # Generates .boot script
   defp make_boot_script(%Release{output_dir: output_dir} = release, rel_dir) do
     Logger.debug "Generating boot script"
+    erts_lib_dir = case release.profile.include_erts do
+                     false -> :code.lib_dir()
+                     true  -> :code.lib_dir()
+                     p     -> String.to_charlist(Path.expand(Path.join(p, "lib")))
+                   end
     options = [{:path, ['#{rel_dir}' | get_code_paths(release)]},
                {:outdir, '#{rel_dir}'},
-               {:variables, [{'ERTS_LIB_DIR', :code.lib_dir()}]},
+               {:variables, [{'ERTS_LIB_DIR', erts_lib_dir}]},
                :no_warn_sasl,
                :no_module_tests,
                :silent]
@@ -661,27 +713,40 @@ defmodule Mix.Releases.Assembler do
   end
 
   defp generate_overlay_vars(release) do
-    vars = [release: release,
-            release_name: release.name,
-            release_version: release.version,
-            is_upgrade: release.is_upgrade,
-            upgrade_from: release.upgrade_from,
-            dev_mode: release.profile.dev_mode,
-            include_erts: release.profile.include_erts,
-            include_src: release.profile.include_src,
-            include_system_libs: release.profile.include_system_libs,
-            erl_opts: release.profile.erl_opts,
-            erts_vsn: Utils.erts_version(),
-            output_dir: release.output_dir] ++ release.profile.overlay_vars
-    Logger.debug "Generated overlay vars:"
-    inspected = Enum.map(vars, fn
-        {:release, _} -> nil
-        {k, v} -> "#{k}=#{inspect v}"
-      end)
-      |> Enum.filter(fn nil -> false; _ -> true end)
-      |> Enum.join("\n    ")
-    Logger.debug "    #{inspected}", :plain
-    {:ok, %{release | :profile => %{release.profile | :overlay_vars => vars}}}
+    erts_vsn = case release.profile.include_erts do
+                 true -> Utils.erts_version()
+                 false -> nil
+                 p when is_binary(p) ->
+                   case Utils.detect_erts_version(p) do
+                     {:ok, vsn} -> vsn
+                     {:error, _} = err -> err
+                   end
+               end
+    case erts_vsn do
+      {:error, _} = err ->
+        err
+      _ ->
+        vars = [release: release,
+                release_name: release.name,
+                release_version: release.version,
+                is_upgrade: release.is_upgrade,
+                upgrade_from: release.upgrade_from,
+                dev_mode: release.profile.dev_mode,
+                include_erts: release.profile.include_erts,
+                include_src: release.profile.include_src,
+                include_system_libs: release.profile.include_system_libs,
+                erl_opts: release.profile.erl_opts,
+                erts_vsn: erts_vsn,
+                output_dir: release.output_dir] ++ release.profile.overlay_vars
+        Logger.debug "Generated overlay vars:"
+        inspected = Enum.map(vars, fn
+            {:release, _} -> nil
+            {k, v} -> "#{k}=#{inspect v}"
+          end)
+          |> Enum.filter(fn nil -> false; _ -> true end)
+          |> Enum.join("\n    ")
+        Logger.debug "    #{inspected}", :plain
+        {:ok, %{release | :profile => %{release.profile | :overlay_vars => vars}}}
+    end
   end
-
 end

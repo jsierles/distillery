@@ -2,6 +2,9 @@
 
 set -e
 
+
+# Set VERBOSE to enable verbose logging of the boot script
+#VERBOSE=true
 # Path to this script
 SCRIPT=$(readlink $0 || true)
 if [ -z $SCRIPT ]; then
@@ -16,10 +19,13 @@ REL_NAME="<%= release_name %>"
 # Current version of the release
 REL_VSN="<%= release_version %>"
 # Current version of ERTS being used
-ERTS_VSN="<%= erts_vsn %>"
+# If this is not present/unset, it will be detected
+<%= unless is_nil(erts_vsn) do %>ERTS_VSN="<%= erts_vsn %>"<% end %>
 # VM code loading mode, embedded by default, can also be interactive
 # See http://erlang.org/doc/man/code.html
 CODE_LOADING_MODE="${CODE_LOADING_MODE:-embedded}"
+# Path to start_erl.data
+START_ERL_DATA="$RELEASE_ROOT_DIR/releases/start_erl.data"
 # Directory containing the current version of this release
 REL_DIR="$RELEASE_ROOT_DIR/releases/$REL_VSN"
 # The lib directory for this release
@@ -79,6 +85,15 @@ escript() {
     "$ERTS_DIR/bin/escript" "$ROOTDIR/$scriptpath" $@
 }
 
+# Private. For determining the version of ERTS available to the release
+_detect_erts_vsn() {
+    erl -boot start_clean -eval 'Ver = erlang:system_info(version), io:format("~s~n", [Ver]), halt()' -noshell
+}
+
+# Private. Gets a list of code paths for this release
+_get_code_paths() {
+    erl -noshell -boot start_clean -eval "{ok, [{release,_,_,Apps}]} = file:consult(\"$REL_DIR/$REL_NAME.rel\"),lists:foreach(fun(A) -> io:fwrite(\"-pa $ROOTDIR/lib/~p-~s/ebin \", [element(1, A), element(2, A)]) end, Apps),halt()."
+}
 
 # Private. For setting ERTS_DIR and ROOTDIR
 _find_erts_dir() {
@@ -112,8 +127,10 @@ _rem_sh() {
             -kernel net_ticktime $TICKTIME \
             "$NAME_TYPE" "$id" -remsh "$NAME" -setcookie "$COOKIE"
     else
+        __code_paths=$(_get_code_paths)
         exec "$BINDIR/erl" \
-            -pa "$ROOTDIR"/lib/*/ebin -pa "$CONSOLIDATED_DIR" \
+            -pa "$CONSOLIDATED_DIR" \
+            ${__code_paths} \
             -hidden -noshell \
             -boot start_clean -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR" \
             -kernel net_ticktime $TICKTIME \
@@ -127,6 +144,12 @@ _start_command() {
     printf "exec \"%s\" \"%s\" -- %s %s" "$RELEASE_ROOT_DIR/bin/$REL_NAME" \
            "$START_OPTION" "${ARGS}" "${EXTRA_OPTS}"
 }
+
+# If ERTS_VSN is not set, detect it
+if [ -z "$ERTS_VSN" ]; then
+    ERTS_VSN="$(_detect_erts_vsn)"
+    echo "$ERTS_VSN $REL_VSN" > "$START_ERL_DATA"
+fi
 
 # Allow override of where to look for config files
 # By default it's $CWD/
@@ -212,7 +235,7 @@ NAME="$(echo "$NAME_ARG" | awk '{print $2}')"
 # Where the pipe will be stored when using `start`
 # This is used so you can attach the running application to the current
 # shell using `attach`
-PIPE_DIR="${PIPE_DIR:-/tmp/erl_pipes/$NAME/}"
+PIPE_DIR="${PIPE_DIR:-$RELEASE_ROOT_DIR/tmp/erl_pipes/$NAME/}"
 
 # Extract the target cookie
 COOKIE_ARG="$(grep '^-setcookie' "$VMARGS_PATH" || true)"
@@ -442,6 +465,7 @@ case "$1" in
         # the console will crash with no TTY attached
         [ -f "$PRE_START_HOOK" ] && . "$PRE_START_HOOK"
 
+        __code_paths=$(_get_code_paths)
         # Build an array of arguments to pass to exec later on
         # Build it here because this command will be used for logging.
         set -- "$BINDIR/erlexec" \
@@ -449,6 +473,7 @@ case "$1" in
             -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR" \
             -env ERL_LIBS "$REL_LIB_DIR" \
             -pa "$CONSOLIDATED_DIR" \
+            ${__code_paths} \
             -args_file "$VMARGS_PATH" \
             -config "$SYS_CONFIG_PATH" \
             -mode "$CODE_LOADING_MODE" \
@@ -457,11 +482,14 @@ case "$1" in
             -extra --no-halt +iex
 
         # Dump environment info for logging purposes
-        echo "Exec: $@" -- ${1+$ARGS} ${EXTRA_OPTS}
-        echo "Root: $ROOTDIR"
+        if [ ! -z $VERBOSE ]; then
+            echo "Exec: $@" -- ${1+$ARGS} ${EXTRA_OPTS}
+            echo "Root: $ROOTDIR"
 
-        # Log the startup
-        echo "$RELEASE_ROOT_DIR"
+            # Log the startup
+            echo "$RELEASE_ROOT_DIR"
+        fi;
+
         logger -t "$REL_NAME[$$]" "Starting up"
 
         exec "$@" -- ${1+$ARGS} ${EXTRA_OPTS}
@@ -499,8 +527,10 @@ case "$1" in
             -extra ${EXTRA_OPTS}
 
         # Dump environment info for logging purposes
-        echo "Exec: $@" -- ${1+$ARGS}
-        echo "Root: $ROOTDIR"
+        if [ ! -z $VERBOSE ]; then
+            echo "Exec: $@" -- ${1+$ARGS}
+            echo "Root: $ROOTDIR"
+        fi;
 
         trap '{}' QUIT TERM KILL HUP USR1 USR2
         "$@" -- ${1+$ARGS} &
@@ -540,12 +570,40 @@ case "$1" in
         shift
         nodetool "eval" $@
         ;;
+    command)
+        # Execute as command-line utility
+        #
+        # Like the escript command, this does not start the OTP application.
+        # If your command depends on a running OTP application,
+        # use
+        #
+        #     {:ok, _} = Application.ensure_all_started(:your_app)
+
+        shift
+        MODULE="$1"; shift
+        FUNCTION="$1"; shift
+
+        # Save extra arguments
+        ARGS="$@"
+
+        # Build arguments for erlexec
+        set -- "$ERL_OPTS"
+        [ "$SYS_CONFIG_PATH" ] && set -- "$@" -config "$SYS_CONFIG_PATH"
+        set -- "$@" -boot_var ERTS_LIB_DIR "$ERTS_LIB_DIR"
+        set -- "$@" -noshell
+        set -- "$@" -boot start_clean
+        set -- "$@" -s "$MODULE" "$FUNCTION"
+
+
+        $BINDIR/erlexec $@ -extra $ARGS
+        exit "$?"
+        ;;
     *)
         __command_path="$REL_DIR/commands/$1"
         if [ -f "$__command_path" ]; then
             . "$__command_path"
         else
-            echo "Usage: $REL_NAME {start|start_boot <file>|foreground|stop|restart|reboot|pid|ping|console|console_clean|console_boot <file>|attach|remote_console|upgrade|downgrade|install|escript|rpc|rpcterms|eval}"
+            echo "Usage: $REL_NAME {start|start_boot <file>|foreground|stop|restart|reboot|pid|ping|console|console_clean|console_boot <file>|attach|remote_console|upgrade|downgrade|install|escript|rpc|rpcterms|eval|command <module> <function> <args>}"
             exit 1
         fi
         ;;
