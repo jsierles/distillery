@@ -38,7 +38,6 @@ defmodule Mix.Releases.Plugin do
   used during assembly/archival.
   The required callback `after_cleanup/1` is passed the command line arguments. The return value is not used.
   """
-  use Behaviour
   alias Mix.Releases.Release
 
   @callback before_assembly(Release.t) :: any
